@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -109,6 +110,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._task_progress: dict[str, dict[str, Any]] = {}  # session_key -> progress info
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -181,12 +183,25 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        tools_count = 0
+
+        # Initialize progress tracking
+        if session_key:
+            self._task_progress[session_key] = {
+                "status": "running",
+                "started_at": time.time(),
+                "iteration": 0,
+                "max_iterations": self.max_iterations,
+                "tool_hint": "",
+                "tools_count": 0,
+            }
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -226,8 +241,16 @@ class AgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+                    tools_count += 1
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+
+                    # Update progress
+                    if session_key:
+                        self._task_progress[session_key]["iteration"] = iteration
+                        self._task_progress[session_key]["tool_hint"] = self._tool_hint([tool_call])
+                        self._task_progress[session_key]["tools_count"] = tools_count
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -270,6 +293,8 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif msg.content.strip().lower() in ("/progress", "进度"):
+                await self._handle_progress(msg)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -287,6 +312,26 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
+    async def _handle_progress(self, msg: InboundMessage) -> None:
+        """Return current task progress for the session (bypasses the processing lock)."""
+        progress = self._task_progress.get(msg.session_key)
+        if not progress or progress.get("status") != "running":
+            content = "当前没有正在执行的任务。"
+        else:
+            elapsed = int(time.time() - progress["started_at"])
+            iteration = progress.get("iteration", 0)
+            max_iter = progress.get("max_iterations", 40)
+            tool_hint = progress.get("tool_hint", "")
+            tools_count = progress.get("tools_count", 0)
+            content = f"""📊 **任务进度**
+- 运行时间: {elapsed}秒
+- 迭代: {iteration}/{max_iter}
+- 当前操作: {tool_hint}
+- 已执行工具: {tools_count}次"""
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
@@ -434,7 +479,11 @@ class AgentLoop:
 
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
+            session_key=session.key,
         )
+
+        # Clear progress tracking when done
+        self._task_progress.pop(session.key, None)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
